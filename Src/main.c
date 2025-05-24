@@ -27,7 +27,28 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+#define HISTORY_SIZE 100
 
+typedef enum {
+    DISPLAY_TIME = 0,
+    DISPLAY_TEMP,
+    DISPLAY_HUM,
+    DISPLAY_HIST_TEMP,
+    DISPLAY_HIST_HUM,
+    DISPLAY_AVG
+} DisplayMode_t;
+
+typedef struct{
+	float temperatura;
+	float humidity;
+	uint32_t timestamp;
+} Measurement;
+
+typedef struct{
+	Measurement data[HISTORY_SIZE];
+	uint16_t head;
+	uint16_t count;
+} RingBuffer;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -46,7 +67,11 @@ DMA_HandleTypeDef hdma_adc1;
 
 I2C_HandleTypeDef hi2c1;
 
+RTC_HandleTypeDef hrtc;
+
 SPI_HandleTypeDef hspi3;
+
+TIM_HandleTypeDef htim2;
 
 UART_HandleTypeDef huart2;
 
@@ -56,7 +81,20 @@ float hum_threshold = 60.0;
 #define ADC_BUF_LEN 2
 uint16_t adc_buf[ADC_BUF_LEN]; // DMA wypełnia ten bufor
 volatile uint8_t screenMode = 1;
+RingBuffer history = {0};
+float last_temp = 0, last_hum = 0;
+float current_temp = 0, current_hum = 0; // Aktualne wartości dla wyświetlania
+uint32_t last_measurement_tick = 0;
 volatile uint32_t screenTimer = 0;
+uint32_t last_avg_tick = 0;
+int16_t history_index = 0;
+DisplayMode_t current_display_mode = DISPLAY_TIME;
+DisplayMode_t last_display_mode = DISPLAY_AVG; // Różny od aktualnego żeby wymusić odświeżenie
+
+// Zmienne dla płynnej aktualizacji czasu
+char last_time_str[16] = "";
+char last_date_str[16] = "";
+uint32_t last_time_update = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,7 +105,27 @@ static void MX_USART2_UART_Init(void);
 static void MX_SPI3_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_RTC_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
+void reset_screen_timer(uint32_t now) {
+    screenTimer = now;
+}
+
+void add_measurement(RingBuffer *buf, float temp, float hum, uint32_t timestamp){
+	buf->data[buf->head].temperatura = temp;
+	buf->data[buf->head].humidity = hum;
+	buf->data[buf->head].timestamp = timestamp;
+	buf->head = (buf->head + 1) % HISTORY_SIZE;
+	if (buf->count < HISTORY_SIZE) buf->count++;
+}
+
+Measurement get_measurement(const RingBuffer *buf, uint16_t index) {
+    if (buf->count == 0) return (Measurement){0};
+    if (index >= buf->count) index = buf->count - 1;
+    uint16_t pos = (buf->head + HISTORY_SIZE - buf->count + index) % HISTORY_SIZE;
+    return buf->data[pos];
+}
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
     if (GPIO_Pin == GPIO_PIN_0 ) { // Debounce 200 ms
@@ -75,10 +133,128 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
             screenMode = 1;
             SSD1331_DisplayON();
             screenTimer = HAL_GetTick(); // Resetuj timer przy KAŻDYM włączeniu
+            last_display_mode = DISPLAY_AVG; // Wymuś odświeżenie
         } else {
             screenMode = 0;
             SSD1331_DisplayOFF();
         }
+    }
+}
+
+void check_power_save(uint32_t now){
+	if(screenMode && (now - screenTimer > 30000)){ // Zmienione na 30s
+		screenMode = 0; // Poprawka: było !screenMode
+		SSD1331_DisplayOFF();
+	}
+}
+
+void get_time_date(char* time, char* date){
+	RTC_DateTypeDef gDate;
+	RTC_TimeTypeDef gTime;
+
+	HAL_RTC_GetDate(&hrtc, &gDate, RTC_FORMAT_BIN);
+	HAL_RTC_GetTime(&hrtc, &gTime, RTC_FORMAT_BIN);
+
+	if(time)
+		sprintf(time,"%02d:%02d:%02d", gTime.Hours, gTime.Minutes, gTime.Seconds);
+	if(date)
+		sprintf(date,"%02d-%02d-%2d", gDate.Date, gDate.Month, 2000+gDate.Year );
+}
+
+void display_time_date_smooth(void) {
+    char time_str[16];
+    char date_str[16];
+    get_time_date(time_str, date_str);
+
+    // Sprawdź czy czas się zmienił
+    if (strcmp(time_str, last_time_str) != 0 || strcmp(date_str, last_date_str) != 0) {
+        // Wyczyść tylko obszar gdzie jest tekst, nie cały ekran
+        SSD1331_drawFrame(RGB_OLED_WIDTH/2 - 48, RGB_OLED_HEIGHT/2 - 10,
+                         RGB_OLED_WIDTH/2 + 48, RGB_OLED_HEIGHT/2 + 25,
+                         COLOR_BLACK, COLOR_BLACK);
+        HAL_Delay(50);
+
+        // Wyświetl nowy czas
+        SSD1331_SetXY(RGB_OLED_WIDTH/2 - 48, RGB_OLED_HEIGHT/2 - 10);
+        SSD1331_FStr(FONT_2X, (unsigned char*)time_str, COLOR_WHITE, COLOR_BLACK);
+        SSD1331_SetXY(RGB_OLED_WIDTH/2 - 38, RGB_OLED_HEIGHT/2 +15);
+        SSD1331_FStr(FONT_1X,  (unsigned char*)date_str , COLOR_WHITE, COLOR_BLACK);
+
+        // Zapisz aktualny czas
+        strcpy(last_time_str, time_str);
+        strcpy(last_date_str, date_str);
+    }
+}
+
+void display_temp(float temp) {
+    char temp_str[16];
+    SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
+    HAL_Delay(10); // Zmniejszone opóźnienie
+    SSD1331_SetXY(RGB_OLED_WIDTH/2 - 40, RGB_OLED_HEIGHT/2 - 10);
+    SSD1331_FStr(FONT_1X, (unsigned char*)"Temperatura :", COLOR_RED, COLOR_BLACK);
+    sprintf(temp_str, "%.2f st. C", temp);
+    SSD1331_SetXY(RGB_OLED_WIDTH/2 - 30, RGB_OLED_HEIGHT/2 +6);
+    SSD1331_FStr(FONT_1X, (unsigned char*)temp_str, COLOR_RED, COLOR_BLACK);
+}
+
+void display_hum(float hum) {
+    char hum_str[16];
+    SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
+    HAL_Delay(10); // Zmniejszone opóźnienie
+    SSD1331_SetXY(RGB_OLED_WIDTH/2 - 32, RGB_OLED_HEIGHT/2 - 10);
+    SSD1331_FStr(FONT_1X, (unsigned char*)"Wilgotnosc :", COLOR_BLUE, COLOR_BLACK);
+    sprintf(hum_str, "%.2f %%", hum);
+    SSD1331_SetXY(RGB_OLED_WIDTH/2 - 35, RGB_OLED_HEIGHT/2 +6);
+    SSD1331_FStr(FONT_1X, (unsigned char*)hum_str, COLOR_BLUE, COLOR_BLACK);
+}
+
+void display_avg(const RingBuffer *buf) {
+    if(buf->count == 0) return;
+    float avg_temp = 0, avg_hum = 0;
+    for(uint16_t i=0; i<buf->count; i++) {
+        Measurement m = get_measurement(buf, i);
+        avg_temp += m.temperatura;
+        avg_hum += m.humidity;
+    }
+    avg_temp /= buf->count;
+    avg_hum /= buf->count;
+    char avg_str[40];
+    sprintf(avg_str, "Srednia T: %.2fC\nSrednia W: %.2f%%", avg_temp, avg_hum);
+    SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
+    SSD1331_SetXY(0, 0);
+    SSD1331_FStr(FONT_1X, (unsigned char*)avg_str, COLOR_YELLOW, COLOR_BLACK);
+}
+
+void display_history_temp(const RingBuffer *buf, int16_t idx) {
+    if(buf->count == 0) return;
+    Measurement m = get_measurement(buf, idx);
+    char hist_str[40];
+    sprintf(hist_str, "T:%.2fC [%d/%d]\nCzas:%lus", m.temperatura, idx+1, buf->count, m.timestamp);
+    SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
+    HAL_Delay(100);
+    SSD1331_SetXY(0, 0);
+    SSD1331_FStr(FONT_1X, (unsigned char*)hist_str, COLOR_GREEN, COLOR_BLACK);
+    HAL_Delay(700);
+}
+
+void display_history_hum(const RingBuffer *buf, int16_t idx) {
+    if(buf->count == 0) return;
+    Measurement m = get_measurement(buf, idx);
+    char hist_str[40];
+    sprintf(hist_str, "W:%.2f%% [%d/%d]\nCzas:%lus", m.humidity, idx+1, buf->count, m.timestamp);
+    SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
+    HAL_Delay(100);
+    SSD1331_SetXY(0, 0);
+    SSD1331_FStr(FONT_1X, (unsigned char*)hist_str, COLOR_CYAN, COLOR_BLACK);
+    HAL_Delay(700);
+}
+
+void update_current_readings(void) {
+    // Aktualizuj aktualne odczyty dla wyświetlania (nie zapisuj do historii)
+    if(AHT30_Read(&current_temp, &current_hum) != HAL_OK) {
+        // Jeśli nie udało się odczytać, użyj ostatnich wartości
+        current_temp = last_temp;
+        current_hum = last_hum;
     }
 }
 /* USER CODE END PFP */
@@ -106,7 +282,6 @@ int main(void)
 
   /* USER CODE BEGIN Init */
 
-
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -123,13 +298,23 @@ int main(void)
   MX_SPI3_Init();
   MX_I2C1_Init();
   MX_ADC1_Init();
+  MX_RTC_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_BUF_LEN);
   HAL_Delay(100);
+
+  // Inicjalizacja AHT30
+  AHT30_Init();
+  HAL_Delay(100);
+
+  //Inicjalizacja konfiguracji ekranu
   SSD1331_init();
   HAL_Delay(100);
+  //Wypelnienie calego ekranu na czarno
   SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
   HAL_Delay(150);
+  //Wyswietlenie wiadomosci powitalnej
   SSD1331_SetXY(RGB_OLED_WIDTH/2 - 40, RGB_OLED_HEIGHT/2 - 10);
   char *wiadomosc = "WELCOME";
   SSD1331_FStr(FONT_2X, (unsigned char*) wiadomosc, COLOR_WHITE, COLOR_BLACK);
@@ -139,136 +324,186 @@ int main(void)
   HAL_Delay(3000);
   SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
   HAL_Delay(100);
+
+  //Deklarowanie zmiennych odnosnie kontroli ekranu
   screenMode = 1;
   screenTimer = HAL_GetTick();
-  /*
-  char buf[16];
-  sprintf(buf, "%d", 123);
-  SSD1331_SetXY(RGB_OLED_WIDTH/2 - 10, RGB_OLED_HEIGHT/2 - 1, 10);
-  SSD1331_FStr(FONT_1X, (unsigned char*)buf, COLOR_WHITE, COLOR_BLACK);*/
+
+  // Początkowy odczyt temperatury i wilgotności
+  if(AHT30_Read(&current_temp, &current_hum) == HAL_OK) {
+      last_temp = current_temp;
+      last_hum = current_hum;
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  float temp, hum;
+  uint32_t now;
+  int16_t last_y_dir = 0; // -1: w dół, 1: w górę, 0: neutral
+  uint32_t last_history_move = 0;
+
   uint32_t led_tick = 0;
   uint8_t led_temp_state = 0;
   uint8_t led_hum_state = 0;
-
+  uint8_t time_display_flag = 1;
 
   while (1)
   {
-	  printf("Timer wynosi: %lu\r\n", HAL_GetTick()-screenTimer);
-	  if(screenMode && (HAL_GetTick() - screenTimer > 30000)) {
-	          screenMode = 0;
-	          SSD1331_DisplayOFF();
-	   }
-	  if(screenMode){
-	          uint16_t xValue = adc_buf[0]; // PC1 (nieużywany, ale gotowy do rozbudowy)
-	          uint16_t yValue = adc_buf[1]; // PC2
+      now = HAL_GetTick();
 
-	          // Wyczyszczenie ekranu
-	          SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
-	          HAL_Delay(100);
-	          if (HAL_GetTick() - led_tick >= 500) {
-	          	        led_tick = HAL_GetTick();
+      check_power_save(now);
 
-	          	        if (AHT30_Read(&temp, &hum) == HAL_OK) {
-	          	          char *tempTag = "Temperatura :";
-	          	          char *humTag =  "Wilgotnosc : ";
-	          	          char temp_val[16];
-	          	          char hum_val[16];
+      if(!screenMode) continue; // ekran wyłączony
 
-	          	        sprintf(temp_val, "%.2f st. C",temp);
-	          	        sprintf(hum_val, "%.2f %%" ,hum);
-	          	        SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
+      // Scheduler: pomiar do historii co 30s
+      if(now - last_measurement_tick >= 30000) {
+          float temp, hum;
+          if(AHT30_Read(&temp, &hum) == HAL_OK) {
+              last_temp = temp;
+              last_hum = hum;
+              add_measurement(&history, temp, hum, now/1000);
+          }
+          last_measurement_tick = now;
+      }
 
-	          	          if (xValue < 1000)
-	          	          {
-	          	        	 SSD1331_SetXY(RGB_OLED_WIDTH/2 - 40, RGB_OLED_HEIGHT/2 - 10);
-	          	             SSD1331_FStr(FONT_1X, (unsigned char*)tempTag, COLOR_RED, COLOR_BLACK);
-	          	             SSD1331_SetXY(RGB_OLED_WIDTH/2 - 35, RGB_OLED_HEIGHT/2 +6);
-	          	           	 SSD1331_FStr(FONT_1X, (unsigned char*)temp_val, COLOR_RED, COLOR_BLACK);
-	          	           if (temp > temp_threshold) {
-	          	           	    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET); // LED ON
-	          	           } else if (temp < temp_threshold) {
-	          	           	    led_temp_state = !led_temp_state;
-	          	           	    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, led_temp_state);
-	          	           } else {
-	          	           	    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
-	          	           }
-	          	          }
-	          	          else if (xValue > 3000)
-	          	          {
-	          	        	SSD1331_SetXY(RGB_OLED_WIDTH/2 - 32, RGB_OLED_HEIGHT/2 - 10);
-	          	        	SSD1331_FStr(FONT_1X, (unsigned char*)humTag, COLOR_BLUE, COLOR_BLACK);
-	          	        	SSD1331_SetXY(RGB_OLED_WIDTH/2 - 20, RGB_OLED_HEIGHT/2 + 6);
-	          	        	SSD1331_FStr(FONT_1X, (unsigned char*)hum_val, COLOR_BLUE, COLOR_BLACK);
-	          	           if (hum > hum_threshold) {
-	          	           	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
-	          	           } else if (hum < hum_threshold) {
-	          	           	 led_hum_state = !led_hum_state;
-	          	           	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, led_hum_state);
-	          	           } else {
-	          	           	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
-	          	           }
-	          	          }
-	          	          // Możesz dodać else, by czyścić ekran lub wyświetlać inne stany
+      // Scheduler: średnia co 270s (pokazuj przez 3s)
+      static uint8_t show_avg = 0;
+      static uint32_t avg_display_start = 0;
+      if(now - last_avg_tick >= 270000) {
+    	  if(!screenMode) SSD1331_DisplayON();
+          current_display_mode = DISPLAY_AVG;
+          show_avg = 1;
+          avg_display_start = now;
+          last_avg_tick = now;
+      }
 
-	          	          HAL_Delay(1400); // Odświeżanie co 150 ms
-	          	          }
-	          }
+      if(show_avg) {
+          if(now - avg_display_start > 3000) {
+              show_avg = 0;
+              current_display_mode = DISPLAY_TIME; // Wróć do zegara
+              last_display_mode = DISPLAY_AVG; // Wymuś odświeżenie
+          }
+          continue;
+      }
 
-	  /*
-	  if (HAL_GetTick() - led_tick >= 500) {
-	        led_tick = HAL_GetTick();
+      // Odczyt joysticka (tylko gdy nie pokazujemy średniej)
+      if(!show_avg) {
+          uint16_t x = adc_buf[0];
+          uint16_t y = adc_buf[1];
 
-	        if (AHT30_Read(&temp, &hum) == HAL_OK) {
-	          char temp_str[16];
-	          char hum_str[16];
+          // Logika joysticka
+          if(x < 1000) {
+        	  time_display_flag = 0;
+              if(current_display_mode != DISPLAY_TEMP || now - last_time_update > 1000) {
+                  update_current_readings(); // Aktualizuj przed wyświetleniem
+                  current_display_mode = DISPLAY_TEMP;
+                  if (current_temp > temp_threshold) {
+                  	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET); // LED ON
+                  } else if (current_temp < temp_threshold) {
+                  	  led_temp_state = !led_temp_state;
+                  	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, led_temp_state);
+                  } else {
+                  	  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
+                  }
+              }
+              reset_screen_timer(now);
+              history_index = 0;
+          } else if(x > 3000) {
+        	  time_display_flag = 0;
+              if(current_display_mode != DISPLAY_HUM || now - last_time_update > 1000) {
+                  update_current_readings(); // Aktualizuj przed wyświetleniem
+                  current_display_mode = DISPLAY_HUM;
+                  if (current_hum > hum_threshold) {
+                  	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
+                  } else if (current_hum < hum_threshold) {
+                  	 led_hum_state = !led_hum_state;
+                  	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, led_hum_state);
+                  } else {
+                  	 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
+                  }
+              }
+              reset_screen_timer(now);
+              history_index = 0;
+          } else if(y < 1000) {
+              // Przeglądanie historii temperatury
+        	  time_display_flag = 0;
+              if(last_y_dir != -1 || now - last_history_move > 300) {
+                  if(history_index < history.count-1) history_index++;
+                  last_y_dir = -1;
+                  last_history_move = now;
+                  current_display_mode = DISPLAY_HIST_TEMP;
+              }
+              reset_screen_timer(now);
+          } else if(y > 3000) {
+              // Przeglądanie historii wilgotności
+        	  time_display_flag = 0;
+              if(last_y_dir != 1 || now - last_history_move > 300) {
+                  if(history_index < history.count-1) history_index++;
+                  last_y_dir = 1;
+                  last_history_move = now;
+                  current_display_mode = DISPLAY_HIST_HUM;
+              }
+              reset_screen_timer(now);
+          } else {
+              current_display_mode = DISPLAY_TIME;
+              history_index = 0;
+              last_y_dir = 0;
+          }
+      }
 
-	        	    // Format values with 1 decimal place
-	          sprintf(temp_str, "Temp: %.2f C", temp);
-	          sprintf(hum_str, "Hum : %.2f %%", hum);
+      // Wyświetlanie na podstawie aktualnego trybu
+      if(current_display_mode != last_display_mode) {
+          // Tryb się zmienił, wyczyść ekran (oprócz płynnego czasu)
+          if(current_display_mode != DISPLAY_TIME) {
+              SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
+              HAL_Delay(50);
+          } else {
+              // Reset dla płynnego czasu
+              strcpy(last_time_str, "");
+              strcpy(last_date_str, "");
+          }
+          last_display_mode = current_display_mode;
+      }
 
-	        	    // Clear display
-	          SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
+      switch(current_display_mode) {
+          case DISPLAY_TIME:
+        	  if(time_display_flag == 0){
+        		  SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
+        		  HAL_Delay(50);
+        		  time_display_flag = 1;
+        	  }
+              display_time_date_smooth();
+              break;
+          case DISPLAY_TEMP:
+              if(now - last_time_update > 1000) { // Aktualizuj co sekundę
+                  update_current_readings();
+                  display_temp(current_temp);
+                  last_time_update = now;
+              }
+              break;
+          case DISPLAY_HUM:
+              if(now - last_time_update > 1000) { // Aktualizuj co sekundę
+                  update_current_readings();
+                  display_hum(current_hum);
+                  last_time_update = now;
+              }
+              break;
+          case DISPLAY_HIST_TEMP:
+        	  time_display_flag = 0;
+              display_history_temp(&history, history_index);
+              break;
+          case DISPLAY_HIST_HUM:
+        	  time_display_flag = 0;
+              display_history_hum(&history, history_index);
+              break;
+          case DISPLAY_AVG:
+        	  time_display_flag = 0;
+              display_avg(&history);
+              break;
+      }
 
-	        	    // Display temperature on first line
-	          SSD1331_SetXY(0, 0);
-	          SSD1331_FStr(FONT_1X, (unsigned char*)temp_str, COLOR_RED, COLOR_BLACK);
-
-	        	    // Display humidity on second line
-	          SSD1331_SetXY(0, 16); // Position for second line
-	          SSD1331_FStr(FONT_1X, (unsigned char*)hum_str, COLOR_BLUE, COLOR_BLACK);
-
-	        	    // Shorter delay or consider removing delay and using timer interrupts
-	          HAL_Delay(2000);
-	          // TEMP LED logic
-	          if (temp > temp_threshold) {
-	            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_13, GPIO_PIN_SET); // LED ON
-	          } else if (temp < temp_threshold) {
-	            led_temp_state = !led_temp_state;
-	            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_13, led_temp_state);
-	          } else {
-	            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_13, GPIO_PIN_RESET);
-	          }
-
-	          // HUM LED logic
-	          if (hum > hum_threshold) {
-	            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
-	          } else if (hum < hum_threshold) {
-	            led_hum_state = !led_hum_state;
-	            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, led_hum_state);
-	          } else {
-	            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
-	          }
-	        }
-	      }
-	    }*/
-	  }
-	  HAL_Delay(100);
+      HAL_Delay(50); // Zmniejszone opóźnienie dla płynniejszego działania
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -286,10 +521,16 @@ void SystemClock_Config(void)
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
+  /** Configure LSE Drive Capability
+  */
+  HAL_PWR_EnableBkUpAccess();
+  __HAL_RCC_LSEDRIVE_CONFIG(RCC_LSEDRIVE_LOW);
+
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSE;
+  RCC_OscInitStruct.LSEState = RCC_LSE_ON;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -313,8 +554,9 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_I2C1;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_I2C1|RCC_PERIPHCLK_RTC;
   PeriphClkInit.I2c1ClockSelection = RCC_I2C1CLKSOURCE_HSI;
+  PeriphClkInit.RTCClockSelection = RCC_RTCCLKSOURCE_LSE;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
     Error_Handler();
@@ -436,6 +678,69 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef sDate = {0};
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127;
+  hrtc.Init.SynchPrediv = 255;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* USER CODE BEGIN Check_RTC_BKUP */
+
+  /* USER CODE END Check_RTC_BKUP */
+
+  /** Initialize RTC and set the Time and Date
+  */
+  sTime.Hours = 0x0;
+  sTime.Minutes = 0x0;
+  sTime.Seconds = 0x0;
+  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sDate.WeekDay = RTC_WEEKDAY_MONDAY;
+  sDate.Month = RTC_MONTH_JANUARY;
+  sDate.Date = 0x1;
+  sDate.Year = 0x0;
+
+  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RTC_Init 2 */
+
+  /* USER CODE END RTC_Init 2 */
+
+}
+
+/**
   * @brief SPI3 Initialization Function
   * @param None
   * @retval None
@@ -472,6 +777,51 @@ static void MX_SPI3_Init(void)
   /* USER CODE BEGIN SPI3_Init 2 */
 
   /* USER CODE END SPI3_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 4294967295;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
 
 }
 
