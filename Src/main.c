@@ -2,17 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2025 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  * @brief          : Main program body - POPRAWIONY
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -104,6 +94,11 @@ uint32_t history_display_start = 0;     // Kiedy zaczęto wyświetlać aktualną
 uint8_t history_browsing_active = 0;    // Czy obecnie przeglądamy historię
 uint8_t history_position_changed = 0;   // Czy pozycja w historii się zmieniła
 uint32_t last_joystick_move = 0;        // Ostatni ruch joystickiem
+
+// **NOWE ZMIENNE DLA AUTOMATYCZNEJ ŚREDNIEJ**
+uint8_t auto_avg_active = 0;            // Czy automatyczne wyświetlanie średniej jest aktywne
+uint32_t auto_avg_start_time = 0;       // Kiedy rozpoczęto automatyczne wyświetlanie średniej
+uint8_t screen_was_off_for_avg = 0;     // Czy ekran był wyłączony przed pokazaniem średniej
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -166,18 +161,27 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
             SSD1331_DisplayON();
             screenTimer = HAL_GetTick(); // Resetuj timer przy KAŻDYM włączeniu
             last_display_mode = DISPLAY_AVG; // Wymuś odświeżenie
+
+            // **ZATRZYMAJ AUTOMATYCZNĄ ŚREDNIĄ PRZY RĘCZNYM WŁĄCZENIU**
+            if(auto_avg_active) {
+                auto_avg_active = 0;
+                current_display_mode = DISPLAY_TIME;
+            }
         } else {
             screenMode = 0;
             SSD1331_DisplayOFF();
+            // **ZATRZYMAJ AUTOMATYCZNĄ ŚREDNIĄ PRZY WYŁĄCZENIU**
+            auto_avg_active = 0;
         }
     }
 }
 
 void check_power_save(uint32_t now){
-	if(screenMode && (now - screenTimer > 30000)){ // Zmienione na 30s
-		screenMode = 0; // Poprawka: było !screenMode
-		SSD1331_DisplayOFF();
-	}
+    // **NIE WYŁĄCZAJ EKRANU PODCZAS AUTOMATYCZNEGO WYŚWIETLANIA ŚREDNIEJ**
+    if(screenMode && !auto_avg_active && (now - screenTimer > 30000)){
+        screenMode = 0;
+        SSD1331_DisplayOFF();
+    }
 }
 
 void get_time_date(char* time, char* date){
@@ -251,13 +255,32 @@ void display_avg(const RingBuffer *buf) {
     avg_temp /= buf->count;
     avg_hum /= buf->count;
     char avg_str[80];
-    sprintf(avg_str, "Srednia T: %.2fC", avg_temp);
+
     SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
-    SSD1331_SetXY(5, 15);
+    HAL_Delay(10);
+
+    // **DODAJ NAGŁÓWEK POKAZUJĄCY ŻE TO AUTOMATYCZNA ŚREDNIA**
+    if(auto_avg_active) {
+        SSD1331_SetXY(5, 5);
+        SSD1331_FStr(FONT_1X, (unsigned char*)"AUTO SREDNIA", COLOR_GREEN, COLOR_BLACK);
+    }
+
+    sprintf(avg_str, "Srednia T: %.2fC", avg_temp);
+    SSD1331_SetXY(5, auto_avg_active ? 20 : 15);
     SSD1331_FStr(FONT_1X, (unsigned char*)avg_str, COLOR_YELLOW, COLOR_BLACK);
     sprintf(avg_str, "Srednia W: %.2f%%", avg_hum);
-    SSD1331_SetXY(5, 30);
+    SSD1331_SetXY(5, auto_avg_active ? 35 : 30);
     SSD1331_FStr(FONT_1X, (unsigned char*)avg_str, COLOR_YELLOW, COLOR_BLACK);
+
+    // **DODAJ INFORMACJĘ O CZASIE POZOSTAŁYM**
+    if(auto_avg_active) {
+        uint32_t remaining = 3000 - (HAL_GetTick() - auto_avg_start_time);
+        if(remaining > 3000) remaining = 0; // Zabezpieczenie przed overflow
+        sprintf(avg_str, "Pozostalo: %lus", remaining/1000 + 1);
+        SSD1331_SetXY(5, 50);
+        SSD1331_FStr(FONT_1X, (unsigned char*)avg_str, COLOR_WHITE, COLOR_BLACK);
+    }
+    HAL_Delay(800);
 }
 
 void display_history_temp(const RingBuffer *buf, int16_t idx) {
@@ -302,7 +325,7 @@ void display_history_hum(const RingBuffer *buf, int16_t idx) {
     // Wyświetl informację o pozycji: najnowszy = 1, najstarszy = count
     int display_pos = buf->count - idx; // Odwróć dla intuicyjnego wyświetlania
 
-    sprintf(line1, "HISTORIA WILG [%d/%d]", display_pos, buf->count); // Przywrócone "HISTORIA WILG"
+    sprintf(line1, "HISTORIA WILG [%d/%d]", display_pos, buf->count);
     sprintf(line2, "Wilg: %.2f %%", m.humidity);
     sprintf(line3, "Czas: %lu s", m.timestamp);
 
@@ -316,6 +339,7 @@ void display_history_hum(const RingBuffer *buf, int16_t idx) {
     SSD1331_SetXY(2, 35);
     SSD1331_FStr(FONT_1X, (unsigned char*)line3, COLOR_CYAN, COLOR_BLACK);
 }
+
 void update_current_readings(void) {
     // Aktualizuj aktualne odczyty dla wyświetlania (nie zapisuj do historii)
     if(AHT30_Read(&current_temp, &current_hum) != HAL_OK) {
@@ -327,6 +351,49 @@ void update_current_readings(void) {
 
 uint8_t is_joystick_in_neutral_position(uint16_t x, uint16_t y) {
     return (x >= 1500 && x <= 2500 && y >= 1500 && y <= 2500);
+}
+
+// **NOWA FUNKCJA - URUCHOM AUTOMATYCZNE WYŚWIETLANIE ŚREDNIEJ**
+void start_auto_avg_display(uint32_t now) {
+    auto_avg_active = 1;
+    auto_avg_start_time = now;
+
+    // Sprawdź czy ekran był wyłączony
+    screen_was_off_for_avg = (screenMode == 0);
+
+    // Włącz ekran jeśli był wyłączony
+    if(screenMode == 0) {
+        screenMode = 1;
+        SSD1331_DisplayON();
+    }
+
+    // Zatrzymaj przeglądanie historii
+    stop_history_browsing();
+
+    // Przełącz na tryb średniej
+    current_display_mode = DISPLAY_AVG;
+    last_display_mode = DISPLAY_TIME; // Wymuś odświeżenie
+
+    // Resetuj timer ekranu żeby nie wyłączył się podczas wyświetlania
+    screenTimer = now;
+}
+
+// **NOWA FUNKCJA - ZATRZYMAJ AUTOMATYCZNE WYŚWIETLANIE ŚREDNIEJ**
+void stop_auto_avg_display(void) {
+    auto_avg_active = 0;
+
+    // Jeśli ekran był wyłączony przed pokazaniem średniej, wyłącz go ponownie
+    if(screen_was_off_for_avg) {
+        screenMode = 0;
+        SSD1331_DisplayOFF();
+    } else {
+        // Jeśli ekran był włączony, wróć do zegara
+        current_display_mode = DISPLAY_TIME;
+        last_display_mode = DISPLAY_AVG; // Wymuś odświeżenie
+        screenTimer = HAL_GetTick(); // Resetuj timer
+    }
+
+    screen_was_off_for_avg = 0;
 }
 /* USER CODE END PFP */
 
@@ -405,6 +472,10 @@ int main(void)
       last_temp = current_temp;
       last_hum = current_hum;
   }
+
+  // **USTAWIENIE POCZĄTKOWEGO CZASU DLA ŚREDNIEJ (dla testów - 30 sekund)**
+  last_avg_tick = 0; // Odejmij 4 minuty, żeby pierwsza średnia pojawiła się za 30s
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -422,6 +493,29 @@ int main(void)
 
       check_power_save(now);
 
+      // **SCHEDULER: AUTOMATYCZNA ŚREDNIA CO 4.5 MINUTY (270 sekund)**
+      if(now - last_avg_tick >= 25000) {
+          start_auto_avg_display(now);
+          last_avg_tick = now;
+      }
+
+      // **SPRAWDŹ CZY ZAKOŃCZYĆ AUTOMATYCZNE WYŚWIETLANIE ŚREDNIEJ**
+      if(auto_avg_active && (now - auto_avg_start_time >= 3000)) {
+    	  SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
+    	  HAL_Delay(20);
+          stop_auto_avg_display();
+      }
+
+      // **JEŚLI AUTOMATYCZNA ŚREDNIA JEST AKTYWNA, POKAŻ JĄ I POMIŃ RESZTĘ**
+      if(auto_avg_active) {
+          if(current_display_mode != last_display_mode) {
+              last_display_mode = current_display_mode;
+          }
+          display_avg(&history);
+          HAL_Delay(50);
+          continue; // Pomiń resztę logiki
+      }
+
       if(!screenMode) continue; // ekran wyłączony
 
       // Scheduler: pomiar do historii co 15s (ale tylko jeśli nie przeglądamy historii)
@@ -435,141 +529,110 @@ int main(void)
           last_measurement_tick = now;
       }
 
-      // Scheduler: średnia co 270s (pokazuj przez 3s)
-      static uint8_t show_avg = 0;
-      static uint32_t avg_display_start = 0;
-      if(now - last_avg_tick >= 270000) {
-    	  if(!screenMode) {
-    	          screenMode = 1;
-    	          SSD1331_DisplayON();
-    	          screenTimer = now;
-    	          // Opcjonalnie: krótka informacja o włączeniu
-    	          SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
-    	          HAL_Delay(100);
-    	      }
-          current_display_mode = DISPLAY_AVG;
-          show_avg = 1;
-          avg_display_start = now;
-          last_avg_tick = now;
-          stop_history_browsing(); // Zatrzymaj przeglądanie historii
-      }
+      // Odczyt joysticka
+      uint16_t x = adc_buf[0];
+      uint16_t y = adc_buf[1];
 
-      if(show_avg) {
-          if(now - avg_display_start > 3000) {
-              show_avg = 0;
-              current_display_mode = DISPLAY_TIME; // Wróć do zegara
-              last_display_mode = DISPLAY_AVG; // Wymuś odświeżenie
-          }
-          continue;
-      }
+      // Logika joysticka
+      if(x < 1000) {
+            time_display_flag = 0;
+            if(current_display_mode != DISPLAY_TEMP || now - last_time_update > 1000) {
+                update_current_readings();
+                current_display_mode = DISPLAY_TEMP;
+                stop_history_browsing(); // Zatrzymaj przeglądanie historii
 
-      // Odczyt joysticka (tylko gdy nie pokazujemy średniej)
-      if(!show_avg) {
-          uint16_t x = adc_buf[0];
-          uint16_t y = adc_buf[1];
-
-          // Logika joysticka
-          if(x < 1000) {
-                time_display_flag = 0;
-                if(current_display_mode != DISPLAY_TEMP || now - last_time_update > 1000) {
-                    update_current_readings();
-                    current_display_mode = DISPLAY_TEMP;
-                    stop_history_browsing(); // Zatrzymaj przeglądanie historii
-
-                    // Obsługa LED dla temperatury
-                    if (current_temp > temp_threshold) {
-                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
-                    } else if (current_temp < temp_threshold) {
-                        led_temp_state = !led_temp_state;
-                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, led_temp_state);
-                    } else {
-                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
-                    }
-                }
-                reset_screen_timer(now);
-
-            } else if(x > 3000) {
-                time_display_flag = 0;
-                if(current_display_mode != DISPLAY_HUM || now - last_time_update > 1000) {
-                    update_current_readings();
-                    current_display_mode = DISPLAY_HUM;
-                    stop_history_browsing(); // Zatrzymaj przeglądanie historii
-
-                    // Obsługa LED dla wilgotności
-                    if (current_hum > hum_threshold) {
-                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
-                    } else if (current_hum < hum_threshold) {
-                        led_hum_state = !led_hum_state;
-                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, led_hum_state);
-                    } else {
-                        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
-                    }
-                }
-                reset_screen_timer(now);
-
-
-             } else if(y < 1000) {
-                      // Przeglądanie historii wilgotności - W DÓŁ = od najnowszych do najstarszych
-                      time_display_flag = 0;
-
-                      // Reset indeksu jeśli wchodzimy do trybu historii po raz pierwszy lub po przerwie
-                      if(current_display_mode != DISPLAY_HIST_HUM) {
-                          history_index = 0; // Zacznij od najnowszego pomiaru
-                          history_position_changed = 1;
-                          history_display_start = now; // Ustaw czas wyświetlania
-                          start_history_browsing(now);
-                      } else {
-                          // Tylko jeśli już jesteśmy w trybie historii, pozwól na nawigację
-                          if(now - last_joystick_move > 500) { // Opóźnienie między ruchami
-                              if(history_index < history.count-1) {
-                                  history_index++; // Przejdź do starszego pomiaru
-                                  history_position_changed = 1;
-                                  history_display_start = now;
-                              }
-                              last_joystick_move = now;
-                          }
-                      }
-                      current_display_mode = DISPLAY_HIST_HUM;
-                      reset_screen_timer(now);
-
-                  } else if(y > 3000) {
-                      // Przeglądanie historii temperatury - W GÓRĘ = od najnowszych do najstarszych
-                      time_display_flag = 0;
-
-                      // Reset indeksu jeśli wchodzimy do trybu historii po raz pierwszy lub po przerwie
-                      if(current_display_mode != DISPLAY_HIST_TEMP) {
-                          history_index = 0; // Zacznij od najnowszego pomiaru
-                          history_position_changed = 1;
-                          history_display_start = now; // Ustaw czas wyświetlania
-                          start_history_browsing(now);
-                      } else {
-                          // Tylko jeśli już jesteśmy w trybie historii, pozwól na nawigację
-                          if(now - last_joystick_move > 500) { // Opóźnienie między ruchami
-                              if(history_index < history.count-1) {
-                                  history_index++; // Przejdź do starszego pomiaru
-                                  history_position_changed = 1;
-                                  history_display_start = now;
-                              }
-                              last_joystick_move = now;
-                          }
-                      }
-                      current_display_mode = DISPLAY_HIST_TEMP;
-                      reset_screen_timer(now);
-                        } else {
-                // POZYCJA NEUTRALNA
-                if(is_joystick_in_neutral_position(x, y)) {
-                    if(history_browsing_active) {
-                        // Jeśli przeglądamy historię, zatrzymaj po powrocie do neutralnej pozycji
-                        if(now - history_navigation_start > 1000) { // Daj czas na stabilizację
-                            stop_history_browsing();
-                            current_display_mode = DISPLAY_TIME;
-                        }
-                    } else {
-                        current_display_mode = DISPLAY_TIME;
-                    }
+                // Obsługa LED dla temperatury
+                if (current_temp > temp_threshold) {
+                    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
+                } else if (current_temp < temp_threshold) {
+                    led_temp_state = !led_temp_state;
+                    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, led_temp_state);
+                } else {
+                    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
                 }
             }
-      }
+            reset_screen_timer(now);
+
+        } else if(x > 3000) {
+            time_display_flag = 0;
+            if(current_display_mode != DISPLAY_HUM || now - last_time_update > 1000) {
+                update_current_readings();
+                current_display_mode = DISPLAY_HUM;
+                stop_history_browsing(); // Zatrzymaj przeglądanie historii
+
+                // Obsługa LED dla wilgotności
+                if (current_hum > hum_threshold) {
+                    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
+                } else if (current_hum < hum_threshold) {
+                    led_hum_state = !led_hum_state;
+                    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, led_hum_state);
+                } else {
+                    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
+                }
+            }
+            reset_screen_timer(now);
+
+         } else if(y < 1000) {
+                  // Przeglądanie historii wilgotności - W DÓŁ = od najnowszych do najstarszych
+                  time_display_flag = 0;
+
+                  // Reset indeksu jeśli wchodzimy do trybu historii po raz pierwszy lub po przerwie
+                  if(current_display_mode != DISPLAY_HIST_HUM) {
+                      history_index = 0; // Zacznij od najnowszego pomiaru
+                      history_position_changed = 1;
+                      history_display_start = now; // Ustaw czas wyświetlania
+                      start_history_browsing(now);
+                  } else {
+                      // Tylko jeśli już jesteśmy w trybie historii, pozwól na nawigację
+                      if(now - last_joystick_move > 500) { // Opóźnienie między ruchami
+                          if(history_index < history.count-1) {
+                              history_index++; // Przejdź do starszego pomiaru
+                              history_position_changed = 1;
+                              history_display_start = now;
+                          }
+                          last_joystick_move = now;
+                      }
+                  }
+                  current_display_mode = DISPLAY_HIST_HUM;
+                  reset_screen_timer(now);
+
+              } else if(y > 3000) {
+                  // Przeglądanie historii temperatury - W GÓRĘ = od najnowszych do najstarszych
+                  time_display_flag = 0;
+
+                  // Reset indeksu jeśli wchodzimy do trybu historii po raz pierwszy lub po przerwie
+                  if(current_display_mode != DISPLAY_HIST_TEMP) {
+                      history_index = 0; // Zacznij od najnowszego pomiaru
+                      history_position_changed = 1;
+                      history_display_start = now; // Ustaw czas wyświetlania
+                      start_history_browsing(now);
+                  } else {
+                      // Tylko jeśli już jesteśmy w trybie historii, pozwól na nawigację
+                      if(now - last_joystick_move > 500) { // Opóźnienie między ruchami
+                          if(history_index < history.count-1) {
+                              history_index++; // Przejdź do starszego pomiaru
+                              history_position_changed = 1;
+                              history_display_start = now;
+                          }
+                          last_joystick_move = now;
+                      }
+                  }
+                  current_display_mode = DISPLAY_HIST_TEMP;
+                  reset_screen_timer(now);
+                    } else {
+            // POZYCJA NEUTRALNA
+            if(is_joystick_in_neutral_position(x, y)) {
+                if(history_browsing_active) {
+                    // Jeśli przeglądamy historię, zatrzymaj po powrocie do neutralnej pozycji
+                    if(now - history_navigation_start > 1000) { // Daj czas na stabilizację
+                        stop_history_browsing();
+                        current_display_mode = DISPLAY_TIME;
+                    }
+                } else {
+                    current_display_mode = DISPLAY_TIME;
+                }
+            }
+        }
 
       // Sprawdź czy automatycznie zatrzymać przeglądanie historii
       if(history_browsing_active && (now - history_navigation_start > HISTORY_PAUSE_TIME)) {
@@ -592,6 +655,7 @@ int main(void)
                 }
                 last_display_mode = current_display_mode;
       }
+
       switch(current_display_mode) {
           case DISPLAY_TIME:
         	  if(time_display_flag == 0){

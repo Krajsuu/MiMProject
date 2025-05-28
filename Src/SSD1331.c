@@ -26,37 +26,43 @@ void _sendData(uint8_t data)
     HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);   // CS = 1
 }
 
+// **POPRAWIONA FUNKCJA INICJALIZACJI**
 void SSD1331_init(void)
 {
-    // Reset ekranu
+    // Reset ekranu - KLUCZOWE!
     HAL_GPIO_WritePin(RESET_GPIO_Port, RESET_Pin, GPIO_PIN_RESET);
     HAL_Delay(10);
     HAL_GPIO_WritePin(RESET_GPIO_Port, RESET_Pin, GPIO_PIN_SET);
     HAL_Delay(10);
 
-    // Inicjalizacja SSD1331
-    _sendCmd(CMD_DISPLAY_OFF);
-    _sendCmd(CMD_SET_CONTRAST_A); _sendCmd(0x91);
-    _sendCmd(CMD_SET_CONTRAST_B); _sendCmd(0x50);
-    _sendCmd(CMD_SET_CONTRAST_C); _sendCmd(0x7D);
-    _sendCmd(CMD_MASTER_CURRENT_CONTROL); _sendCmd(0x06);
-    _sendCmd(CMD_SET_PRECHARGE_SPEED_A); _sendCmd(0x64);
-    _sendCmd(CMD_SET_PRECHARGE_SPEED_B); _sendCmd(0x78);
-    _sendCmd(CMD_SET_PRECHARGE_SPEED_C); _sendCmd(0x64);
-    _sendCmd(CMD_SET_REMAP); _sendCmd(0x72);
-    _sendCmd(CMD_SET_DISPLAY_START_LINE); _sendCmd(0x0);
-    _sendCmd(CMD_SET_DISPLAY_OFFSET); _sendCmd(0x0);
-    _sendCmd(CMD_NORMAL_DISPLAY);
-    _sendCmd(CMD_SET_MULTIPLEX_RATIO); _sendCmd(0x3F);
-    _sendCmd(CMD_SET_MASTER_CONFIGURE); _sendCmd(0x8E);
-    _sendCmd(CMD_POWER_SAVE_MODE); _sendCmd(0x00);
-    _sendCmd(CMD_PHASE_PERIOD_ADJUSTMENT); _sendCmd(0x31);
-    _sendCmd(CMD_DISPLAY_CLOCK_DIV); _sendCmd(0xF0);
-    _sendCmd(CMD_SET_PRECHARGE_VOLTAGE); _sendCmd(0x3A);
-    _sendCmd(CMD_SET_V_VOLTAGE); _sendCmd(0x3E);
-    _sendCmd(CMD_DEACTIVE_SCROLLING);
-    _sendCmd(CMD_NORMAL_BRIGHTNESS_DISPLAY_ON);
+    // Inicjalizacja SSD1331 - KOMPLETNA SEKWENCJA
+    _sendCmd(CMD_DISPLAY_OFF);                    // Wyłącz ekran podczas inicjalizacji
+    _sendCmd(CMD_SET_CONTRAST_A); _sendCmd(0x91); // Kontrast dla kolor A (czerwony)
+    _sendCmd(CMD_SET_CONTRAST_B); _sendCmd(0x50); // Kontrast dla kolor B (zielony)
+    _sendCmd(CMD_SET_CONTRAST_C); _sendCmd(0x7D); // Kontrast dla kolor C (niebieski)
+    _sendCmd(CMD_MASTER_CURRENT_CONTROL); _sendCmd(0x06); // Kontrola głównego prądu
+    _sendCmd(CMD_SET_PRECHARGE_SPEED_A); _sendCmd(0x64);  // Prędkość ładowania A
+    _sendCmd(CMD_SET_PRECHARGE_SPEED_B); _sendCmd(0x78);  // Prędkość ładowania B
+    _sendCmd(CMD_SET_PRECHARGE_SPEED_C); _sendCmd(0x64);  // Prędkość ładowania C
+    _sendCmd(CMD_SET_REMAP); _sendCmd(0x72);              // Mapowanie kolorów i orientacja
+    _sendCmd(CMD_SET_DISPLAY_START_LINE); _sendCmd(0x0);  // Linia startowa
+    _sendCmd(CMD_SET_DISPLAY_OFFSET); _sendCmd(0x0);      // Offset wyświetlania
+    _sendCmd(CMD_NORMAL_DISPLAY);                         // Normalny tryb wyświetlania
+    _sendCmd(CMD_SET_MULTIPLEX_RATIO); _sendCmd(0x3F);    // Współczynnik multipleks (64 linie)
+    _sendCmd(CMD_SET_MASTER_CONFIGURE); _sendCmd(0x8E);   // Konfiguracja główna
+    _sendCmd(CMD_POWER_SAVE_MODE); _sendCmd(0x00);        // Wyłącz tryb oszczędzania energii
+    _sendCmd(CMD_PHASE_PERIOD_ADJUSTMENT); _sendCmd(0x31); // Regulacja okresu fazy
+    _sendCmd(CMD_DISPLAY_CLOCK_DIV); _sendCmd(0xF0);      // Dzielnik zegara wyświetlania
+    _sendCmd(CMD_SET_PRECHARGE_VOLTAGE); _sendCmd(0x3A);  // Napięcie ładowania wstępnego
+    _sendCmd(CMD_SET_V_VOLTAGE); _sendCmd(0x3E);          // Napięcie V
+    _sendCmd(CMD_DEACTIVE_SCROLLING);                     // Wyłącz scrollowanie
+
+    // **KLUCZOWE - WŁĄCZ EKRAN NA KOŃCU**
+    _sendCmd(CMD_NORMAL_BRIGHTNESS_DISPLAY_ON);           // Włącz ekran z normalną jasnością
+
+    HAL_Delay(100); // Daj czas na stabilizację
 }
+
 void SSD1331_drawPixel(uint16_t x, uint16_t y, uint16_t color)
 {
     if ((x < 0) || (x >= RGB_OLED_WIDTH) || (y < 0) || (y >= RGB_OLED_HEIGHT))
@@ -420,6 +426,7 @@ void SSD1331_DisplayON(void)
 {
 	_sendCmd(CMD_NORMAL_BRIGHTNESS_DISPLAY_ON);
 }
+
 void SSD1331_DisplayOFF(void){
 	_sendCmd(CMD_DISPLAY_OFF);
 }
