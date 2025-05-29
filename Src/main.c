@@ -266,10 +266,10 @@ void display_avg(const RingBuffer *buf) {
     }
 
     sprintf(avg_str, "Srednia T: %.2fC", avg_temp);
-    SSD1331_SetXY(5, auto_avg_active ? 20 : 15);
+    SSD1331_SetXY(0, auto_avg_active ? 20 : 15);
     SSD1331_FStr(FONT_1X, (unsigned char*)avg_str, COLOR_YELLOW, COLOR_BLACK);
     sprintf(avg_str, "Srednia W: %.2f%%", avg_hum);
-    SSD1331_SetXY(5, auto_avg_active ? 35 : 30);
+    SSD1331_SetXY(0, auto_avg_active ? 35 : 30);
     SSD1331_FStr(FONT_1X, (unsigned char*)avg_str, COLOR_YELLOW, COLOR_BLACK);
 
     // **DODAJ INFORMACJĘ O CZASIE POZOSTAŁYM**
@@ -310,6 +310,7 @@ void display_history_temp(const RingBuffer *buf, int16_t idx) {
     SSD1331_FStr(FONT_1X, (unsigned char*)line2, COLOR_GREEN, COLOR_BLACK);
     SSD1331_SetXY(2, 35);
     SSD1331_FStr(FONT_1X, (unsigned char*)line3, COLOR_GREEN, COLOR_BLACK);
+    HAL_Delay(800);
 }
 
 void display_history_hum(const RingBuffer *buf, int16_t idx) {
@@ -338,6 +339,7 @@ void display_history_hum(const RingBuffer *buf, int16_t idx) {
     SSD1331_FStr(FONT_1X, (unsigned char*)line2, COLOR_CYAN, COLOR_BLACK);
     SSD1331_SetXY(2, 35);
     SSD1331_FStr(FONT_1X, (unsigned char*)line3, COLOR_CYAN, COLOR_BLACK);
+    HAL_Delay(800);
 }
 
 void update_current_readings(void) {
@@ -494,13 +496,13 @@ int main(void)
       check_power_save(now);
 
       // **SCHEDULER: AUTOMATYCZNA ŚREDNIA CO 4.5 MINUTY (270 sekund)**
-      if(now - last_avg_tick >= 25000) {
+      if(now - last_avg_tick >= 50000) {
           start_auto_avg_display(now);
           last_avg_tick = now;
       }
 
       // **SPRAWDŹ CZY ZAKOŃCZYĆ AUTOMATYCZNE WYŚWIETLANIE ŚREDNIEJ**
-      if(auto_avg_active && (now - auto_avg_start_time >= 3000)) {
+      if(auto_avg_active && (now - auto_avg_start_time >= 6000)) {
     	  SSD1331_drawFrame(0, 0, RGB_OLED_WIDTH - 1, RGB_OLED_HEIGHT - 1, COLOR_BLACK, COLOR_BLACK);
     	  HAL_Delay(20);
           stop_auto_avg_display();
