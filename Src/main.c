@@ -274,8 +274,8 @@ void display_avg(const RingBuffer *buf) {
 
     // **DODAJ INFORMACJĘ O CZASIE POZOSTAŁYM**
     if(auto_avg_active) {
-        uint32_t remaining = 3000 - (HAL_GetTick() - auto_avg_start_time);
-        if(remaining > 3000) remaining = 0; // Zabezpieczenie przed overflow
+        uint32_t remaining = 6000 - (HAL_GetTick() - auto_avg_start_time);
+        if(remaining > 6000) remaining = 0; // Zabezpieczenie przed overflow
         sprintf(avg_str, "Pozostalo: %lus", remaining/1000 + 1);
         SSD1331_SetXY(5, 50);
         SSD1331_FStr(FONT_1X, (unsigned char*)avg_str, COLOR_WHITE, COLOR_BLACK);
